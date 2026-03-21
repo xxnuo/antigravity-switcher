@@ -38,64 +38,97 @@ type userInfo struct {
 	Email string `json:"email"`
 }
 
+type cliOptions struct {
+	email        string
+	refreshToken string
+	dbPath       string
+	userDataDir  string
+	noRestart    bool
+	interactive  bool
+}
+
+type positionalArgs struct {
+	email        string
+	refreshToken string
+	dbPath       string
+}
+
 func main() {
-	emailFlag := flag.String("email", "", "")
-	refreshTokenFlag := flag.String("refresh-token", "", "")
-	dbPathFlag := flag.String("db-path", "", "")
-	userDataDirFlag := flag.String("user-data-dir", "", "")
-	noRestartFlag := flag.Bool("no-restart", false, "")
-	flag.Parse()
-
-	reader := bufio.NewReader(os.Stdin)
-
-	email := strings.TrimSpace(*emailFlag)
-	if email == "" {
-		email = prompt(reader, "Email")
+	if err := run(os.Args, os.Stdin, os.Stdout); err != nil {
+		fail(err.Error())
 	}
+}
 
-	refreshToken := strings.TrimSpace(*refreshTokenFlag)
+func run(args []string, stdin io.Reader, stdout io.Writer) error {
+	options, err := parseCLIArgs(args)
+	if err != nil {
+		return err
+	}
+	options.interactive = isInteractiveInput(stdin)
+
+	reader := bufio.NewReader(stdin)
+
+	refreshToken := options.refreshToken
 	if refreshToken == "" {
-		refreshToken = prompt(reader, "Refresh Token")
+		if !options.interactive {
+			return errors.New("缺少 refresh_token，请使用参数直接传递")
+		}
+		refreshToken = prompt(reader, stdout, "Refresh Token")
 	}
-
-	if email == "" || refreshToken == "" {
-		fail("email 和 refresh_token 不能为空")
+	if refreshToken == "" {
+		return errors.New("refresh_token 不能为空")
 	}
 
 	tokenResp, err := refreshAccessToken(refreshToken)
 	if err != nil {
-		fail(err.Error())
+		return err
 	}
 
+	email := options.email
 	if resolvedEmail, err := fetchUserEmail(tokenResp.AccessToken); err == nil && resolvedEmail != "" {
 		email = resolvedEmail
 	}
-
-	dbPath, err := resolveDBPath(strings.TrimSpace(*dbPathFlag), strings.TrimSpace(*userDataDirFlag))
-	if err != nil {
-		fmt.Println(err.Error())
-		dbPath = strings.TrimSpace(prompt(reader, "state.vscdb 路径"))
-		if dbPath == "" {
-			fail("未提供 state.vscdb 路径")
+	if email == "" {
+		if !options.interactive {
+			return errors.New("缺少 email，且无法通过 access_token 自动获取")
 		}
+		email = prompt(reader, stdout, "Email")
+	}
+	if email == "" {
+		return errors.New("email 不能为空")
 	}
 
-	if _, err := os.Stat(dbPath); err != nil {
-		fail(fmt.Sprintf("数据库不存在: %s", dbPath))
+	dbPath, err := resolveDBPath(options.dbPath, options.userDataDir)
+	if err != nil {
+		if !options.interactive {
+			return err
+		}
+		fmt.Fprintln(stdout, err.Error())
+		dbPath = prompt(reader, stdout, "state.vscdb 路径")
+		dbPath, err = normalizePath(dbPath)
+		if err != nil {
+			return err
+		}
+		if dbPath == "" {
+			return errors.New("未提供 state.vscdb 路径")
+		}
+	}
+	if err := validateDBPath(dbPath); err != nil {
+		return err
 	}
 
 	wasRunning := false
-	if !*noRestartFlag {
+	if !options.noRestart {
 		wasRunning = isAntigravityRunning()
 		if wasRunning {
 			if err := stopAntigravity(); err != nil {
-				fail(err.Error())
+				return err
 			}
 		}
 	}
 
 	restarted := false
-	if wasRunning && !*noRestartFlag {
+	if wasRunning && !options.noRestart {
 		defer func() {
 			if restarted {
 				return
@@ -106,29 +139,242 @@ func main() {
 
 	backupPath, err := backupFile(dbPath)
 	if err != nil {
-		fail(err.Error())
+		return err
 	}
 
 	expiry := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Unix()
 	if err := injectTokens(dbPath, email, tokenResp.AccessToken, refreshToken, expiry); err != nil {
-		fail(err.Error())
+		return err
 	}
 
-	if wasRunning && !*noRestartFlag {
+	if wasRunning && !options.noRestart {
 		if err := startAntigravity(); err != nil {
-			fail(err.Error())
+			return err
 		}
 		restarted = true
 	}
 
-	fmt.Println("切号完成")
-	fmt.Println("Email:", email)
-	fmt.Println("DB:", dbPath)
-	fmt.Println("Backup:", backupPath)
+	fmt.Fprintln(stdout, "切号完成")
+	fmt.Fprintln(stdout, "Email:", email)
+	fmt.Fprintln(stdout, "DB:", dbPath)
+	fmt.Fprintln(stdout, "Backup:", backupPath)
+	return nil
 }
 
-func prompt(reader *bufio.Reader, label string) string {
-	fmt.Printf("%s: ", label)
+func parseCLIArgs(args []string) (cliOptions, error) {
+	name := "antigravity-tools"
+	if len(args) > 0 && strings.TrimSpace(args[0]) != "" {
+		name = filepath.Base(args[0])
+	}
+	parseArgs := []string{}
+	if len(args) > 1 {
+		parseArgs = args[1:]
+	}
+	flagArgs, positionalValues, err := splitCLIArgs(parseArgs)
+	if err != nil {
+		return cliOptions{}, err
+	}
+
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	emailFlag := fs.String("email", "", "")
+	refreshTokenFlag := fs.String("refresh-token", "", "")
+	dbPathFlag := fs.String("db-path", "", "")
+	userDataDirFlag := fs.String("user-data-dir", "", "")
+	noRestartFlag := fs.Bool("no-restart", false, "")
+
+	if err := fs.Parse(flagArgs); err != nil {
+		return cliOptions{}, fmt.Errorf("参数解析失败: %w", err)
+	}
+
+	positional, err := parsePositionalArgs(positionalValues)
+	if err != nil {
+		return cliOptions{}, err
+	}
+
+	email, err := mergeCLIValue("email", *emailFlag, positional.email)
+	if err != nil {
+		return cliOptions{}, err
+	}
+	refreshToken, err := mergeCLIValue("refresh-token", *refreshTokenFlag, positional.refreshToken)
+	if err != nil {
+		return cliOptions{}, err
+	}
+	dbPath, err := mergeCLIValue("db-path", *dbPathFlag, positional.dbPath)
+	if err != nil {
+		return cliOptions{}, err
+	}
+
+	dbPath, err = normalizePath(dbPath)
+	if err != nil {
+		return cliOptions{}, err
+	}
+	userDataDir, err := normalizePath(*userDataDirFlag)
+	if err != nil {
+		return cliOptions{}, err
+	}
+
+	return cliOptions{
+		email:        email,
+		refreshToken: refreshToken,
+		dbPath:       dbPath,
+		userDataDir:  userDataDir,
+		noRestart:    *noRestartFlag,
+	}, nil
+}
+
+func splitCLIArgs(args []string) ([]string, []string, error) {
+	var flagArgs []string
+	var positionalArgs []string
+
+	for index := 0; index < len(args); index++ {
+		arg := strings.TrimSpace(args[index])
+		if arg == "" {
+			continue
+		}
+		if arg == "--" {
+			for _, value := range args[index+1:] {
+				value = strings.TrimSpace(value)
+				if value != "" {
+					positionalArgs = append(positionalArgs, value)
+				}
+			}
+			break
+		}
+
+		switch {
+		case isBoolFlag(arg), hasInlineValueFlag(arg):
+			flagArgs = append(flagArgs, arg)
+		case requiresSeparateValueFlag(arg):
+			if index+1 >= len(args) || strings.TrimSpace(args[index+1]) == "" {
+				return nil, nil, fmt.Errorf("参数 %s 缺少值", arg)
+			}
+			flagArgs = append(flagArgs, arg, strings.TrimSpace(args[index+1]))
+			index++
+		case strings.HasPrefix(arg, "-"):
+			return nil, nil, fmt.Errorf("参数解析失败: %s", arg)
+		default:
+			positionalArgs = append(positionalArgs, arg)
+		}
+	}
+
+	return flagArgs, positionalArgs, nil
+}
+
+func isBoolFlag(arg string) bool {
+	return arg == "-no-restart" ||
+		arg == "--no-restart" ||
+		arg == "-h" ||
+		arg == "--help" ||
+		strings.HasPrefix(arg, "-no-restart=") ||
+		strings.HasPrefix(arg, "--no-restart=")
+}
+
+func hasInlineValueFlag(arg string) bool {
+	for _, name := range []string{"email", "refresh-token", "db-path", "user-data-dir"} {
+		if strings.HasPrefix(arg, "-"+name+"=") || strings.HasPrefix(arg, "--"+name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func requiresSeparateValueFlag(arg string) bool {
+	for _, name := range []string{"email", "refresh-token", "db-path", "user-data-dir"} {
+		if arg == "-"+name || arg == "--"+name {
+			return true
+		}
+	}
+	return false
+}
+
+func parsePositionalArgs(args []string) (positionalArgs, error) {
+	values := make([]string, 0, len(args))
+	for _, arg := range args {
+		arg = strings.TrimSpace(arg)
+		if arg != "" {
+			values = append(values, arg)
+		}
+	}
+
+	switch len(values) {
+	case 0:
+		return positionalArgs{}, nil
+	case 1:
+		return positionalArgs{refreshToken: values[0]}, nil
+	case 2:
+		if looksLikeEmail(values[0]) {
+			return positionalArgs{email: values[0], refreshToken: values[1]}, nil
+		}
+		return positionalArgs{refreshToken: values[0], dbPath: values[1]}, nil
+	case 3:
+		if !looksLikeEmail(values[0]) {
+			return positionalArgs{}, errors.New("位置参数格式错误，仅支持: <refresh-token> | <email> <refresh-token> | <refresh-token> <db-path> | <email> <refresh-token> <db-path>")
+		}
+		return positionalArgs{
+			email:        values[0],
+			refreshToken: values[1],
+			dbPath:       values[2],
+		}, nil
+	default:
+		return positionalArgs{}, errors.New("位置参数过多，仅支持: <refresh-token> | <email> <refresh-token> | <refresh-token> <db-path> | <email> <refresh-token> <db-path>")
+	}
+}
+
+func mergeCLIValue(name, flagValue, positionalValue string) (string, error) {
+	flagValue = strings.TrimSpace(flagValue)
+	positionalValue = strings.TrimSpace(positionalValue)
+	if flagValue == "" {
+		return positionalValue, nil
+	}
+	if positionalValue == "" || positionalValue == flagValue {
+		return flagValue, nil
+	}
+	return "", fmt.Errorf("参数 %s 同时通过 flag 和位置参数传入且值不一致", name)
+}
+
+func looksLikeEmail(value string) bool {
+	return strings.Count(value, "@") == 1 && !strings.ContainsAny(value, `/\`)
+}
+
+func normalizePath(path string) (string, error) {
+	path = strings.TrimSpace(os.ExpandEnv(path))
+	if path == "" {
+		return "", nil
+	}
+	if path == "~" || strings.HasPrefix(path, "~/") || strings.HasPrefix(path, "~\\") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("解析用户目录失败: %w", err)
+		}
+		if path == "~" {
+			path = home
+		} else {
+			path = filepath.Join(home, path[2:])
+		}
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("规范化路径失败: %w", err)
+	}
+	return filepath.Clean(absPath), nil
+}
+
+func isInteractiveInput(stdin io.Reader) bool {
+	file, ok := stdin.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+func prompt(reader *bufio.Reader, writer io.Writer, label string) string {
+	fmt.Fprintf(writer, "%s: ", label)
 	text, _ := reader.ReadString('\n')
 	return strings.TrimSpace(text)
 }
@@ -204,16 +450,29 @@ func fetchUserEmail(accessToken string) (string, error) {
 }
 
 func resolveDBPath(dbPath, userDataDir string) (string, error) {
+	var err error
+	dbPath, err = normalizePath(dbPath)
+	if err != nil {
+		return "", err
+	}
 	if dbPath != "" {
 		return dbPath, nil
 	}
 
 	if value := strings.TrimSpace(os.Getenv("ANTIGRAVITY_DB_PATH")); value != "" {
+		value, err = normalizePath(value)
+		if err != nil {
+			return "", err
+		}
 		return value, nil
 	}
 
 	if userDataDir == "" {
 		userDataDir = strings.TrimSpace(os.Getenv("ANTIGRAVITY_USER_DATA_DIR"))
+	}
+	userDataDir, err = normalizePath(userDataDir)
+	if err != nil {
+		return "", err
 	}
 	if userDataDir != "" {
 		path := filepath.Join(userDataDir, "User", "globalStorage", "state.vscdb")
@@ -232,6 +491,32 @@ func resolveDBPath(dbPath, userDataDir string) (string, error) {
 	}
 
 	return "", fmt.Errorf("未自动找到 state.vscdb，默认路径尝试为: %s", path)
+}
+
+func validateDBPath(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("数据库不存在: %s", path)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("数据库路径是目录: %s", path)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return fmt.Errorf("打开数据库失败: %w", err)
+	}
+	defer db.Close()
+
+	var tableName string
+	err = db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, "ItemTable").Scan(&tableName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errors.New("数据库缺少 ItemTable")
+	}
+	if err != nil {
+		return fmt.Errorf("校验数据库失败: %w", err)
+	}
+	return nil
 }
 
 func defaultDBPath() string {
@@ -405,10 +690,13 @@ func backupFile(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("创建备份失败: %w", err)
 	}
-	defer target.Close()
 
 	if _, err := io.Copy(target, source); err != nil {
+		target.Close()
 		return "", fmt.Errorf("写入备份失败: %w", err)
+	}
+	if err := target.Close(); err != nil {
+		return "", fmt.Errorf("关闭备份文件失败: %w", err)
 	}
 	return backupPath, nil
 }
@@ -518,14 +806,24 @@ func skipField(data []byte, offset int, wireType uint8) (int, error) {
 		_, next, err := readVarint(data, offset)
 		return next, err
 	case 1:
+		if offset+8 > len(data) {
+			return offset, errors.New("protobuf fixed64 字段越界")
+		}
 		return offset + 8, nil
 	case 2:
 		length, next, err := readVarint(data, offset)
 		if err != nil {
 			return offset, err
 		}
-		return next + int(length), nil
+		end := next + int(length)
+		if end < next || end > len(data) {
+			return offset, errors.New("protobuf 字段越界")
+		}
+		return end, nil
 	case 5:
+		if offset+4 > len(data) {
+			return offset, errors.New("protobuf fixed32 字段越界")
+		}
 		return offset + 4, nil
 	default:
 		return offset, fmt.Errorf("未知 protobuf wire type: %d", wireType)
