@@ -122,6 +122,48 @@ func TestResolveDBPathFromUserDataDir(t *testing.T) {
 	}
 }
 
+func TestExtractUserDataDirFromCommandLine(t *testing.T) {
+	tempDir := t.TempDir()
+	got := extractUserDataDirFromCommandLine(`"/Applications/Antigravity.app/Contents/MacOS/Antigravity" --user-data-dir "` + tempDir + `" --flag`)
+	if got != tempDir {
+		t.Fatalf("unexpected user data dir: %q", got)
+	}
+
+	got = extractUserDataDirFromCommandLine(`Antigravity --user-data-dir=` + tempDir)
+	if got != tempDir {
+		t.Fatalf("unexpected inline user data dir: %q", got)
+	}
+}
+
+func TestDetectDBFormats(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.vscdb")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO ItemTable (key, value) VALUES (?, ?), (?, ?)`,
+		"antigravityUnifiedStateSync.oauthToken", "x",
+		"jetskiStateSync.agentManagerInitState", "y",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	formats, err := detectDBFormats(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !formats.newFormat || !formats.oldFormat {
+		t.Fatalf("unexpected formats: %+v", formats)
+	}
+}
+
 func TestValidateDBPath(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "state.vscdb")
@@ -174,6 +216,9 @@ func TestInjectTokens(t *testing.T) {
 	oldBlob = append(oldBlob, createOAuthField("old-access", "old-refresh", 111)...)
 	oldB64 := base64.StdEncoding.EncodeToString(oldBlob)
 	if _, err := db.Exec(`INSERT INTO ItemTable (key, value) VALUES (?, ?)`, "jetskiStateSync.agentManagerInitState", oldB64); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO ItemTable (key, value) VALUES (?, ?)`, "antigravityUnifiedStateSync.oauthToken", "seed"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -252,6 +297,48 @@ func TestInjectTokens(t *testing.T) {
 
 	if _, err := os.Stat(dbPath); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestInjectTokensOldFormatOnly(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "state.vscdb")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	oldBlob := append(encodeStringField(9, "keep"), createEmailField("old@example.com")...)
+	oldBlob = append(oldBlob, createOAuthField("old-access", "old-refresh", 111)...)
+	oldB64 := base64.StdEncoding.EncodeToString(oldBlob)
+	if _, err := db.Exec(`INSERT INTO ItemTable (key, value) VALUES (?, ?)`, "jetskiStateSync.agentManagerInitState", oldB64); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := injectTokens(dbPath, "new@example.com", "new-access", "new-refresh", 222); err != nil {
+		t.Fatal(err)
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM ItemTable WHERE key = ?`, "antigravityUnifiedStateSync.oauthToken").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("unexpected new format row count: %d", count)
+	}
+
+	var onboarding string
+	if err := db.QueryRow(`SELECT value FROM ItemTable WHERE key = ?`, "antigravityOnboarding").Scan(&onboarding); err != nil {
+		t.Fatal(err)
+	}
+	if onboarding != "true" {
+		t.Fatalf("unexpected onboarding value: %s", onboarding)
 	}
 }
 

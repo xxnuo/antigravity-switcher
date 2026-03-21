@@ -53,6 +53,11 @@ type positionalArgs struct {
 	dbPath       string
 }
 
+type dbFormats struct {
+	newFormat bool
+	oldFormat bool
+}
+
 func main() {
 	if err := run(os.Args, os.Stdin, os.Stdout); err != nil {
 		fail(err.Error())
@@ -459,6 +464,9 @@ func resolveDBPath(dbPath, userDataDir string) (string, error) {
 		return dbPath, nil
 	}
 
+	if userDataDir == "" {
+		userDataDir = runningProcessUserDataDir()
+	}
 	if value := strings.TrimSpace(os.Getenv("ANTIGRAVITY_DB_PATH")); value != "" {
 		value, err = normalizePath(value)
 		if err != nil {
@@ -491,6 +499,126 @@ func resolveDBPath(dbPath, userDataDir string) (string, error) {
 	}
 
 	return "", fmt.Errorf("未自动找到 state.vscdb，默认路径尝试为: %s", path)
+}
+
+func runningProcessUserDataDir() string {
+	switch runtime.GOOS {
+	case "windows":
+		return parseUserDataDirFromWindowsProcess()
+	default:
+		return parseUserDataDirFromPSProcess()
+	}
+}
+
+func parseUserDataDirFromPSProcess() string {
+	output, err := exec.Command("ps", "-axo", "command=").Output()
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !looksLikeAntigravityCommand(line) {
+			continue
+		}
+		if value := extractUserDataDirFromCommandLine(line); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func parseUserDataDirFromWindowsProcess() string {
+	output, err := exec.Command("powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_Process | Select-Object -ExpandProperty CommandLine").Output()
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !looksLikeAntigravityCommand(line) {
+			continue
+		}
+		if value := extractUserDataDirFromCommandLine(line); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func looksLikeAntigravityCommand(command string) bool {
+	command = strings.ToLower(strings.TrimSpace(command))
+	if command == "" {
+		return false
+	}
+	if strings.Contains(command, "antigravity-switcher") || strings.Contains(command, "antigravity-tools") || strings.Contains(command, "antigravity-manager") {
+		return false
+	}
+	return strings.Contains(command, "antigravity")
+}
+
+func extractUserDataDirFromCommandLine(command string) string {
+	args, err := splitCommandLine(command)
+	if err != nil {
+		return ""
+	}
+	for index := 0; index < len(args); index++ {
+		arg := strings.TrimSpace(args[index])
+		if arg == "--user-data-dir" && index+1 < len(args) {
+			path, err := normalizePath(args[index+1])
+			if err == nil && path != "" {
+				return path
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--user-data-dir=") {
+			path, err := normalizePath(strings.TrimPrefix(arg, "--user-data-dir="))
+			if err == nil && path != "" {
+				return path
+			}
+		}
+	}
+	return ""
+}
+
+func splitCommandLine(command string) ([]string, error) {
+	var args []string
+	var current strings.Builder
+	var quote rune
+	escaped := false
+
+	for _, ch := range command {
+		switch {
+		case escaped:
+			current.WriteRune(ch)
+			escaped = false
+		case ch == '\\' && quote != '\'':
+			escaped = true
+		case quote != 0:
+			if ch == quote {
+				quote = 0
+			} else {
+				current.WriteRune(ch)
+			}
+		case ch == '\'' || ch == '"':
+			quote = ch
+		case ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r':
+			if current.Len() > 0 {
+				args = append(args, current.String())
+				current.Reset()
+			}
+		default:
+			current.WriteRune(ch)
+		}
+	}
+
+	if escaped || quote != 0 {
+		return nil, errors.New("命令行解析失败")
+	}
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+	return args, nil
 }
 
 func validateDBPath(path string) error {
@@ -712,17 +840,26 @@ func injectTokens(dbPath, email, accessToken, refreshToken string, expiry int64)
 		return fmt.Errorf("设置 busy_timeout 失败: %w", err)
 	}
 
+	formats, err := detectDBFormats(db)
+	if err != nil {
+		return err
+	}
+
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("开始事务失败: %w", err)
 	}
 	defer tx.Rollback()
 
-	if err := writeNewFormat(tx, accessToken, refreshToken, expiry); err != nil {
-		return err
+	if formats.newFormat || !formats.oldFormat {
+		if err := writeNewFormat(tx, accessToken, refreshToken, expiry); err != nil {
+			return err
+		}
 	}
-	if err := writeOldFormat(tx, email, accessToken, refreshToken, expiry); err != nil {
-		return err
+	if formats.oldFormat {
+		if err := writeOldFormat(tx, email, accessToken, refreshToken, expiry); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.Exec(`INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)`, "antigravityOnboarding", "true"); err != nil {
 		return fmt.Errorf("写入 onboarding 标记失败: %w", err)
@@ -731,6 +868,32 @@ func injectTokens(dbPath, email, accessToken, refreshToken string, expiry int64)
 		return fmt.Errorf("提交事务失败: %w", err)
 	}
 	return nil
+}
+
+func detectDBFormats(db *sql.DB) (dbFormats, error) {
+	rows, err := db.Query(`SELECT key FROM ItemTable WHERE key IN (?, ?)`, "antigravityUnifiedStateSync.oauthToken", "jetskiStateSync.agentManagerInitState")
+	if err != nil {
+		return dbFormats{}, fmt.Errorf("读取数据库格式失败: %w", err)
+	}
+	defer rows.Close()
+
+	var formats dbFormats
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return dbFormats{}, fmt.Errorf("读取数据库格式失败: %w", err)
+		}
+		switch key {
+		case "antigravityUnifiedStateSync.oauthToken":
+			formats.newFormat = true
+		case "jetskiStateSync.agentManagerInitState":
+			formats.oldFormat = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return dbFormats{}, fmt.Errorf("读取数据库格式失败: %w", err)
+	}
+	return formats, nil
 }
 
 func writeNewFormat(tx *sql.Tx, accessToken, refreshToken string, expiry int64) error {
