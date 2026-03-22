@@ -26,8 +26,8 @@ run:
 
 release: $(RELEASE_TARGETS:%=build-%)
 
-build-%:
-	@target="$*"; \
+$(RELEASE_TARGETS:%=build-%):
+	@target="$(patsubst build-%,%,$@)"; \
 	os=$${target%-*}; \
 	arch=$${target#*-}; \
 	ext=""; \
